@@ -1,0 +1,100 @@
+// This is your Prisma schema file.
+// Learn more: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Role {
+  id          String   @id @default(uuid())
+  name        String   @unique // "standard" | "premium" | "developer"
+  description String?
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  users           User[]
+  roleIndicators  RoleIndicator[]
+
+  @@map("roles")
+}
+
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  passwordHash String   @map("password_hash")
+  name         String
+  roleId       String   @map("role_id")
+  isActive     Boolean  @default(true) @map("is_active")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  role        Role            @relation(fields: [roleId], references: [id])
+  watchlist   Watchlist[]
+  preferences UserPreferences?
+
+  @@index([email])
+  @@map("users")
+}
+
+model Indicator {
+  id          String  @id // e.g. "SMA_20", "RSI_14"
+  name        String  // "Simple Moving Average (20)"
+  description String?
+  category    String  // "trend" | "momentum" | "volatility" | "volume"
+  scale       String  // "price" | "oscillator"
+  isActive    Boolean @default(true) @map("is_active")
+
+  roleIndicators RoleIndicator[]
+
+  @@map("indicators")
+}
+
+model RoleIndicator {
+  roleId      String @map("role_id")
+  indicatorId String @map("indicator_id")
+
+  role      Role      @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  indicator Indicator @relation(fields: [indicatorId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, indicatorId])
+  @@map("role_indicators")
+}
+
+model Market {
+  id       String  @id // "india" | "us"
+  name     String  // "Indian Market"
+  exchange String  // "NSE/BSE"
+  isActive Boolean @default(true) @map("is_active")
+
+  @@map("markets")
+}
+
+model Watchlist {
+  id      String   @id @default(uuid())
+  userId  String   @map("user_id")
+  symbol  String   // uppercase stock ticker
+  addedAt DateTime @default(now()) @map("added_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, symbol])
+  @@index([userId])
+  @@map("watchlists")
+}
+
+model UserPreferences {
+  id                  String   @id @default(uuid())
+  userId              String   @unique @map("user_id")
+  preferredIndicators String[] @default([]) @map("preferred_indicators") // max 4, sorted, uppercase
+  theme               String   @default("light") // "light" | "dark"
+  createdAt           DateTime @default(now()) @map("created_at")
+  updatedAt           DateTime @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("user_preferences")
+}
