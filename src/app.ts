@@ -17,6 +17,7 @@ import preferencesRoutes from './modules/preferences/preferences.routes';
 import marketsRoutes     from './modules/markets/markets.routes';
 import indicatorsRoutes  from './modules/indicators/indicators.routes';
 import screenerRoutes    from './modules/screener/screener.routes';
+import backtestRoutes    from './modules/backtest/backtest.routes';
 import chatbotRoutes     from './modules/chatbot/chatbot.routes';
 import stockDetailRoutes from './modules/stock-detail/stock-detail.routes';
 import logsRoutes        from './modules/logs/logs.routes';
@@ -77,9 +78,10 @@ app.use('/api/watchlist', watchlistRoutes);
 app.use('/api/preferences', preferencesRoutes);
 app.use('/api/markets', marketsRoutes);
 app.use('/api/indicators', indicatorsRoutes);
-app.use('/api/screen', screenerRoutes);
+app.use('/api/screen',   screenerRoutes);
+app.use('/api/backtest', backtestRoutes);
 app.use('/api/chat', chatbotRoutes);
-app.use('/api/stocks', stockDetailRoutes);
+app.use('/api/stock-details', stockDetailRoutes);
 app.use('/api/logs', logsRoutes);
 
 // Swagger UI – /api/docs in dev/staging only

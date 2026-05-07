@@ -98,3 +98,14 @@ model UserPreferences {
 
   @@map("user_preferences")
 }
+
+model EmailOtp {
+  id        String   @id @default(uuid())
+  email     String
+  otpHash   String   @map("otp_hash")
+  expiresAt DateTime @map("expires_at")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([email])
+  @@map("email_otps")
+}

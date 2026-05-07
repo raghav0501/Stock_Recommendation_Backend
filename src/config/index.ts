@@ -21,7 +21,7 @@ const envSchema = z.object({
 
   // ── JWT ────────────────────────────────────────────────────────────────
   JWT_SECRET: z.string().min(32, 'JWT_SECRET must be at least 32 chars'),
-  JWT_EXPIRES_IN: z.string().default('15m'),
+  JWT_EXPIRES_IN: z.string().default('360m'),
   REFRESH_TOKEN_SECRET: z.string().min(32),
   REFRESH_TOKEN_EXPIRES_IN: z.string().default('7d'),
   REFRESH_TOKEN_ENCRYPTION_KEY: z.string().min(32),
@@ -48,9 +48,23 @@ const envSchema = z.object({
   PIPELINE_NEWS_SEARCH_URL: z.string().default('http://localhost:8004'),
   PIPELINE_CHATBOT_URL: z.string().default('http://localhost:8007'),
 
-  // ── Email ──────────────────────────────────────────────────────────────
+    // ── Python FastAPI monolith (existing Cloud Run service) ────────────────
+  // Each backend module calls the relevant Python endpoint directly.
+  PYTHON_API_BASE_URL: z.string().default('https://demo2-664110982097.us-central1.run.app'),
+
+  // ── Email / SMTP ───────────────────────────────────────────────────────────
   EMAIL_FROM: z.string().default('noreply@alumnus.app'),
   PASSWORD_RESET_TOKEN_TTL_SECONDS: z.string().default('900').transform(Number),
+  SMTP_HOST: z.string().default('smtp.gmail.com'),
+  SMTP_PORT: z.string().default('587').transform(Number),
+  SMTP_SECURE: z.string().default('false').transform((v) => v === 'true'),
+  SMTP_USER: z.string().default(''),
+  SMTP_PASS: z.string().default(''),
+
+  // ── OTP ────────────────────────────────────────────────────────────────────
+  OTP_HMAC_SECRET: z.string().min(32, 'OTP_HMAC_SECRET must be at least 32 characters'),
+  OTP_TTL_SECONDS: z.string().default('300').transform(Number),
+  OTP_COOLING_SECONDS: z.string().default('60').transform(Number),
 });
 
 const parsed = envSchema.safeParse(process.env);

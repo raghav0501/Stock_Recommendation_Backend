@@ -1,206 +1,165 @@
 /**
- * Stock detail aggregation service.
+ * Stock Detail Service
  *
- * No caching — all 6 pipeline calls are made on every request.
- * Partial failures are handled gracefully via Promise.allSettled.
- * Cache will be added in a future version.
+ * Calls the Python FastAPI service for three endpoints:
+ *
+ * 1. POST /api/stock-details
+ *    Request:  { exchange, symbol, indicators: string[] }
+ *    Response: { success, metadata?, ohlcv, technicals, summary }
+ *
+ * 2. POST /api/stock_snapshot/:exchange/:symbol
+ *    Response: { exchange, ticker, currency, stock_data: { ...fundamentals } }
+ *
+ * 3. GET /api/news/stock/combined/:symbol
+ *    Response: { success, ticker, rss_news, telegram_news, full_summary, ... }
+ *
+ * All responses are returned unchanged to the frontend.
  */
-import axios from 'axios';
-import { config } from '../../config';
+import { callPython, PythonCallContext } from '../../utils/pythonClient';
 import { createServiceLogger } from '../../infrastructure/logger';
 
 const log = createServiceLogger('stock-detail');
 
-interface StockDetailContext {
-  sessionId:            string;
-  requestId:            string;
-  userId:               string;
-  entitledIndicatorIds: string[];
+// ── Type shapes (matching frontend's backendService.ts types exactly) ───────
+
+export interface OHLCVData {
+  time:   string;
+  open:   number;
+  high:   number;
+  low:    number;
+  close:  number;
+  volume: number;
 }
 
-type PipelineStatus = 'fulfilled' | 'rejected';
-
-interface PipelineResult<T> {
-  status: PipelineStatus;
-  data:   T | null;
-  error:  string | null;
+export interface TechnicalData {
+  time: string;
+  [key: string]: number | string | null | undefined;
 }
 
-async function callPipeline<T>(
-  name: string,
-  fn:   () => Promise<T>,
-  ctx:  { sessionId: string; requestId: string },
-): Promise<PipelineResult<T>> {
-  const start = Date.now();
-  try {
-    const data      = await fn();
-    const latencyMs = Date.now() - start;
-    log.pipelineCall(name, latencyMs, 'success', ctx);
-    return { status: 'fulfilled', data, error: null };
-  } catch (err) {
-    const latencyMs = Date.now() - start;
-    const errMsg    = err instanceof Error ? err.message : String(err);
-    log.pipelineCall(name, latencyMs, 'error', ctx, errMsg);
-    return { status: 'rejected', data: null, error: errMsg };
-  }
+export interface StockMetadata {
+  company_name: string;
+  sector:       string;
+  industry:     string;
+  description:  string;
+  website:      string;
+  country:      string;
+  employees:    number;
 }
 
-// ── Dummy data generators ──────────────────────────────────────────────────
-function dummyMetadata(symbol: string) {
-  return { symbol, name: `${symbol} Corporation`, sector: 'Technology', exchange: 'NSE', currency: 'INR', source: 'dummy' };
+export interface StockDetailsResponse {
+  success:    boolean;
+  metadata?:  StockMetadata;
+  ohlcv:      OHLCVData[];
+  technicals: TechnicalData[];
+  summary:    string;
 }
 
-function dummyOhlcv(symbol: string, range: string) {
-  const days    = range === '1W' ? 5 : range === '1M' ? 22 : range === '3M' ? 66 : 252;
-  const candles = Array.from({ length: days }, (_, i) => {
-    const base  = 500 + Math.random() * 500;
-    const open  = +(base + Math.random() * 10).toFixed(2);
-    const close = +(base + Math.random() * 10).toFixed(2);
-    return {
-      date:   new Date(Date.now() - (days - i) * 86400000).toISOString().slice(0, 10),
-      open, high: +(Math.max(open, close) + Math.random() * 5).toFixed(2),
-      low:   +(Math.min(open, close) - Math.random() * 5).toFixed(2),
-      close, volume: Math.floor(Math.random() * 1_000_000),
-    };
+export interface StockFundamentals {
+  symbol:        string;
+  date:          string;
+  open:          number;
+  high:          number;
+  low:           number;
+  close:         number;
+  volume:        number;
+  avg_volume:    number;
+  trailing_pe:   number;
+  forward_pe:    number;
+  market_cap:    number;
+  eps:           number;
+  high_52w:      number;
+  low_52w:       number;
+  price_to_book: number;
+}
+
+export interface FundamentalsResponse {
+  exchange:   string;
+  ticker:     string;
+  currency:   string;
+  stock_data: StockFundamentals;
+}
+
+export interface NewsArticle {
+  news_id:        string;
+  title:          string;
+  url:            string;
+  source:         string;
+  published_date: string;
+  description:    string;
+  thumbnail_url:  string;
+  score:          number;
+}
+
+export interface StockNewsResponse {
+  success:             boolean;
+  ticker:              string;
+  rss_news:            NewsArticle[];
+  rss_news_count:      number;
+  rss_summary:         string;
+  telegram_news:       NewsArticle[];
+  telegram_news_count: number;
+  telegram_summary:    string;
+  full_summary:        string;
+  error:               string | null;
+}
+
+// ── Service functions ────────────────────────────────────────────────────────
+
+export async function getStockDetails(
+  exchange:   string,
+  symbol:     string,
+  indicators: string[],
+  ctx:        PythonCallContext,
+): Promise<StockDetailsResponse> {
+  log.info('Stock details requested', {
+    sessionId: ctx.sessionId, requestId: ctx.requestId, userId: ctx.userId,
+    meta: { exchange, symbol, indicatorCount: indicators.length },
   });
-  return { symbol, range, candles, source: 'dummy' };
+
+  const result = await callPython<StockDetailsResponse>(
+    'POST',
+    '/api/stock-details',
+    ctx,
+    { exchange, symbol, indicators },
+  );
+
+  log.info('Stock details received', {
+    sessionId: ctx.sessionId, requestId: ctx.requestId, userId: ctx.userId,
+    meta: { symbol, ohlcvCount: result.ohlcv?.length ?? 0 },
+  });
+
+  return result;
 }
 
-function dummyIndicators(symbol: string, entitledIds: string[]) {
-  return {
-    symbol,
-    indicators: Object.fromEntries(entitledIds.map((id) => [id, +(Math.random() * 100).toFixed(2)])),
-    source: 'dummy',
-  };
+export async function getStockSnapshot(
+  exchange: string,
+  symbol:   string,
+  ctx:      PythonCallContext,
+): Promise<FundamentalsResponse> {
+  log.info('Stock snapshot requested', {
+    sessionId: ctx.sessionId, requestId: ctx.requestId, userId: ctx.userId,
+    meta: { exchange, symbol },
+  });
+
+  return callPython<FundamentalsResponse>(
+    'POST',
+    `/api/stock_snapshot/${exchange}/${symbol}`,
+    ctx,
+  );
 }
 
-function dummyNews(symbol: string) {
-  return {
-    symbol,
-    articles: [
-      { title: `${symbol} reports strong quarterly results`, source: 'Economic Times', publishedAt: new Date().toISOString(), url: '#' },
-      { title: `Analysts upgrade ${symbol} to overweight`,   source: 'Mint',           publishedAt: new Date().toISOString(), url: '#' },
-    ],
-    source: 'dummy',
-  };
-}
-
-function dummyFundamentals(symbol: string) {
-  return { symbol, pe: 22.5, eps: 45.3, marketCap: '2.1T', dividendYield: '1.2%', revenue: '450B', source: 'dummy' };
-}
-
-function dummyAiSummary(symbol: string) {
-  return { summaryText: `${symbol} is showing bullish momentum based on recent technical indicators. RSI is in a neutral zone. (Dummy — chatbot pipeline not yet connected.)` };
-}
-
-// ── Main aggregation ───────────────────────────────────────────────────────
-export async function getStockDetail(
+export async function getStockNews(
   symbol: string,
-  range:  string,
-  ctx:    StockDetailContext,
-) {
-  const normalSymbol = symbol.toUpperCase();
-  const headers      = { 'x-session-id': ctx.sessionId, 'x-request-id': ctx.requestId };
-
-  log.info('Stock detail requested', {
+  ctx:    PythonCallContext,
+): Promise<StockNewsResponse> {
+  log.info('Stock news requested', {
     sessionId: ctx.sessionId, requestId: ctx.requestId, userId: ctx.userId,
-    meta: { symbol: normalSymbol, range },
+    meta: { symbol },
   });
 
-  // ── Parallel pipeline dispatch ─────────────────────────────────────────
-  const [metadataResult, chartResult, technicalResult, newsResult, fundamentalsResult, aiSummaryResult] =
-    await Promise.all([
-      callPipeline('stock-ingestion-metadata', async () => {
-        try {
-          const r = await axios.get(
-            `${config.PIPELINE_SCREENER_URL.replace('8001', '8006')}/stock/${normalSymbol}/metadata`,
-            { timeout: config.PIPELINE_TIMEOUT_MS, headers },
-          );
-          return r.data as unknown;
-        } catch { return dummyMetadata(normalSymbol); }
-      }, ctx),
-
-      callPipeline('stock-ingestion-ohlcv', async () => {
-        try {
-          const r = await axios.get(
-            `${config.PIPELINE_SCREENER_URL.replace('8001', '8006')}/stock/${normalSymbol}/ohlcv`,
-            { params: { range }, timeout: config.PIPELINE_TIMEOUT_MS, headers },
-          );
-          return r.data as unknown;
-        } catch { return dummyOhlcv(normalSymbol, range); }
-      }, ctx),
-
-      callPipeline('technical-pipeline', async () => {
-        try {
-          const r = await axios.get(
-            `${config.PIPELINE_TECHNICAL_URL}/indicators/${normalSymbol}`,
-            { params: { range, indicators: ctx.entitledIndicatorIds.join(',') }, timeout: config.PIPELINE_TIMEOUT_MS, headers },
-          );
-          return r.data as unknown;
-        } catch { return dummyIndicators(normalSymbol, ctx.entitledIndicatorIds); }
-      }, ctx),
-
-      callPipeline('news-search', async () => {
-        try {
-          const r = await axios.get(
-            `${config.PIPELINE_NEWS_SEARCH_URL}/news/search`,
-            { params: { symbol: normalSymbol }, timeout: config.PIPELINE_TIMEOUT_MS, headers },
-          );
-          return r.data as unknown;
-        } catch { return dummyNews(normalSymbol); }
-      }, ctx),
-
-      callPipeline('fundamental-pipeline', async () => {
-        try {
-          const r = await axios.get(
-            `${config.PIPELINE_FUNDAMENTAL_URL}/fundamentals/${normalSymbol}`,
-            { timeout: config.PIPELINE_TIMEOUT_MS, headers },
-          );
-          return r.data as unknown;
-        } catch { return dummyFundamentals(normalSymbol); }
-      }, ctx),
-
-      callPipeline('chatbot-summary', async () => {
-        try {
-          const r = await axios.post(
-            `${config.PIPELINE_CHATBOT_URL}/chat/summary`,
-            { symbol: normalSymbol, range },
-            { timeout: config.PIPELINE_TIMEOUT_MS, headers },
-          );
-          return r.data as unknown;
-        } catch { return dummyAiSummary(normalSymbol); }
-      }, ctx),
-    ]);
-
-  // ── Assemble with partial failure handling ─────────────────────────────
-  const errors: Record<string, string> = {};
-  const extract = <T>(result: PipelineResult<T>, section: string): T | null => {
-    if (result.status === 'rejected') { errors[section] = result.error ?? 'Service unavailable'; return null; }
-    return result.data;
-  };
-
-  const aggregate = {
-    data: {
-      metadata:     extract(metadataResult,    'metadata'),
-      chart:        extract(chartResult,        'chart'),
-      indicators:   extract(technicalResult,   'indicators'),
-      news:         extract(newsResult,         'news'),
-      fundamentals: extract(fundamentalsResult, 'fundamentals'),
-      aiSummary:    extract(aiSummaryResult,   'aiSummary'),
-    },
-    meta: {
-      generatedAt: new Date().toISOString(),
-      dataSource:  'EOD' as const,
-      symbol:      normalSymbol,
-      range,
-    },
-    ...(Object.keys(errors).length ? { errors } : {}),
-  };
-
-  log.info('Stock detail assembled', {
-    sessionId: ctx.sessionId, requestId: ctx.requestId, userId: ctx.userId,
-    meta: { symbol: normalSymbol, range, partialErrors: Object.keys(errors) },
-  });
-
-  return aggregate;
+  return callPython<StockNewsResponse>(
+    'GET',
+    `/api/news/stock/combined/${symbol}`,
+    ctx,
+  );
 }

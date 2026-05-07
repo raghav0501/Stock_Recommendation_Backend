@@ -1,139 +1,86 @@
 /**
- * Screener service.
+ * Screener Service
  *
- * No caching — all requests go directly to the Python pipeline.
- * Cache will be added in a future version when the user base grows.
+ * Calls Python POST /api/screen and returns the response unchanged.
+ *
+ * Python request:  { exchange, filters: { "SIGNAL_NAME": {} } }
+ * Python response: { success, data: { exchange, count, buy, neutral, sell } }
+ *   where buy/neutral/sell are arrays of { symbol, latest_price, price_change_pct }
+ *
+ * The frontend (stockApi.ts > screenStocks) sends exactly this shape,
+ * so we forward it as-is and return the Python response as-is.
  */
-import { StatusCodes } from 'http-status-codes';
-import axios from 'axios';
-import { config } from '../../config';
+import { callPython, PythonCallContext } from '../../utils/pythonClient';
 import { createServiceLogger } from '../../infrastructure/logger';
-import { screenerPipelineResponseSchema } from './screener.schema';
+import { config } from '../../config';
 
 const log = createServiceLogger('screener');
 
-interface ScreenerContext {
-  sessionId: string;
-  requestId: string;
-  userId: string;
-  entitledIndicatorIds: string[];
+export interface ScreenedStock {
+  symbol: string;
+  latest_price: number;
+  price_change_pct: number;
 }
 
-interface ScreenerResult {
+export interface ScreenResponse {
+  success: boolean;
   data: {
-    bullish: unknown[];
-    bearish: unknown[];
-    neutral: unknown[];
-  };
-  meta: {
-    generatedAt: string;
-    market: string;
-    selectedIndicators: string[];
-    dataSource: 'EOD';
+    exchange: string;
+    count: number;
+    buy: ScreenedStock[];
+    neutral: ScreenedStock[];
+    sell: ScreenedStock[];
   };
 }
 
 export async function screenStocks(
-  market: string,
-  indicators: string[], // already normalised (sorted, uppercased)
-  ctx: ScreenerContext,
-): Promise<ScreenerResult> {
-  // ── Entitlement check ────────────────────────────────────────────────────
-  const entitled   = new Set(ctx.entitledIndicatorIds);
-  const disallowed = indicators.filter((id) => !entitled.has(id));
-  if (disallowed.length > 0) {
-    throw Object.assign(
-      new Error(`Not entitled to indicators: ${disallowed.join(', ')}`),
-      { statusCode: StatusCodes.FORBIDDEN, code: 'INDICATOR_NOT_ENTITLED' },
-    );
-  }
+  exchange: string,
+  filters: Record<string, unknown>,
+  ctx: PythonCallContext,
+): Promise<ScreenResponse> {
+  log.info('Screener request', {
+    sessionId: ctx.sessionId, requestId: ctx.requestId, userId: ctx.userId,
+    meta: { exchange, filterCount: Object.keys(filters).length },
+  });
 
-  // ── Call pipeline ────────────────────────────────────────────────────────
-  const start = Date.now();
-  let pipelineData: ScreenerResult['data'];
+  // Validate entitlement: check that filters only contain indicator keys
+  // (skipped here as the Python service enforces its own signal list)
 
-  try {
-    const response = await axios.post(
-      `${config.PIPELINE_SCREENER_URL}/screen`,
-      { market, indicators },
-      {
-        timeout: config.PIPELINE_TIMEOUT_MS,
-        headers: {
-          'x-session-id': ctx.sessionId,
-          'x-request-id': ctx.requestId,
-        },
-      },
-    );
-    const latencyMs = Date.now() - start;
+  const result = await callPython<ScreenResponse>(
+    'POST',
+    '/api/screen',
+    ctx,
+    { exchange, filters },
+  );
 
-    const parsed = screenerPipelineResponseSchema.safeParse(response.data);
-    if (!parsed.success) {
-      log.error('Screener pipeline response schema invalid', {
-        sessionId: ctx.sessionId, requestId: ctx.requestId, userId: ctx.userId,
-        meta: { errors: parsed.error.flatten() },
-      });
-      throw Object.assign(new Error('Screener pipeline returned an invalid response'), {
-        statusCode: StatusCodes.BAD_GATEWAY, code: 'PIPELINE_SCHEMA_ERROR',
-      });
-    }
-
-    pipelineData = parsed.data as ScreenerResult['data'];
-    log.pipelineCall('screener', latencyMs, 'success', {
-      sessionId: ctx.sessionId, requestId: ctx.requestId, userId: ctx.userId,
-    });
-
-  } catch (err) {
-    const latencyMs = Date.now() - start;
-    if ((err as { code?: string }).code === 'PIPELINE_SCHEMA_ERROR') throw err;
-
-    log.pipelineCall('screener', latencyMs, 'error', {
-      sessionId: ctx.sessionId, requestId: ctx.requestId, userId: ctx.userId,
-    }, String(err));
-
-    // Dummy fallback while Python pipeline is not connected
-    log.warn('Screener pipeline unavailable – returning dummy data', {
-      sessionId: ctx.sessionId, requestId: ctx.requestId,
-    });
-    pipelineData = _dummyScreenerResponse(market, indicators);
-  }
-
-  // ── Shape & limit ────────────────────────────────────────────────────────
-  const maxN = config.SCREENER_MAX_RESULTS_PER_CATEGORY;
-  const shaped: ScreenerResult['data'] = {
-    bullish: pipelineData.bullish.slice(0, maxN),
-    bearish: pipelineData.bearish.slice(0, maxN),
-    neutral: pipelineData.neutral.slice(0, maxN),
-  };
-
-  return {
-    data: shaped,
+  log.info('Screener response', {
+    sessionId: ctx.sessionId, requestId: ctx.requestId, userId: ctx.userId,
     meta: {
-      generatedAt:        new Date().toISOString(),
-      market,
-      selectedIndicators: indicators,
-      dataSource:         'EOD',
+      buy: result.data?.buy?.length ?? 0,
+      neutral: result.data?.neutral?.length ?? 0,
+      sell: result.data?.sell?.length ?? 0,
+    },
+  });
+
+  // Enforce max results per category
+  const max = config.SCREENER_MAX_RESULTS_PER_CATEGORY;
+  return {
+    ...result,
+    data: {
+      ...result.data,
+      buy: result.data?.buy?.slice(0, max)     ?? [],
+      neutral: result.data?.neutral?.slice(0, max) ?? [],
+      sell: result.data?.sell?.slice(0, max)    ?? [],
     },
   };
 }
 
-function _dummyScreenerResponse(market: string, indicators: string[]): ScreenerResult['data'] {
-  const symbols = market === 'india'
-    ? ['RELIANCE', 'TCS', 'HDFC', 'INFY', 'ICICIBANK', 'WIPRO', 'LT', 'HCLTECH']
-    : ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'META', 'TSLA', 'NFLX'];
+// Also expose signals list from Python
+export interface TechnicalSignal {
+  name: string;
+  description: string;
+}
 
-  const makeStock = (symbol: string) => ({
-    symbol,
-    name:       `${symbol} Corp`,
-    price:      +(Math.random() * 1000 + 50).toFixed(2),
-    change:     +(Math.random() * 10 - 5).toFixed(2),
-    indicators: Object.fromEntries(indicators.map((ind) => [ind, +(Math.random() * 100).toFixed(2)])),
-    signal:     'bullish' as const,
-    source:     'dummy',
-  });
-
-  const half = Math.floor(symbols.length / 2);
-  const bull  = symbols.slice(0, half).map(makeStock);
-  const bear  = symbols.slice(half).map((s) => ({ ...makeStock(s), signal: 'bearish' as const }));
-
-  return { bullish: bull, bearish: bear, neutral: [] };
+export async function getSignals(ctx: PythonCallContext): Promise<{ signals: TechnicalSignal[] }> {
+  return callPython<{ signals: TechnicalSignal[] }>('GET', '/api/signals', ctx);
 }

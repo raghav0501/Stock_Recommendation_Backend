@@ -1,17 +1,20 @@
 import { z } from 'zod';
 
+// Frontend sends: 
+// {
+//   "exchange": "india",
+//   "filters": {
+//     "rsi_14": {},
+//     "sma_50": {}
+//   }
+// }
+// We also accept the simpler array form from internal use: { exchange, indicators: ["SMA_20"] }
 export const screenerRequestSchema = z.object({
-  market: z.string().min(1, 'Market is required'),
-  indicators: z
-    .array(z.string().min(1))
-    .min(1, 'At least 1 indicator required')
-    .max(4, 'At most 4 indicators allowed')
-    .transform((arr) => [...arr].map((i) => i.toUpperCase()).sort()),
+  exchange: z.string().min(1, 'exchange is required'),
+  // filters is an object whose keys are signal names — matches Python exactly
+  filters: z.record(z.unknown()).optional(),
+  // convenience array form — converted to filters object in service
+  indicators: z.array(z.string()).optional(),
 });
 
-// Schema for validating the pipeline response
-export const screenerPipelineResponseSchema = z.object({
-  bullish: z.array(z.record(z.unknown())),
-  bearish: z.array(z.record(z.unknown())),
-  neutral: z.array(z.record(z.unknown())).optional().default([]),
-});
+export type ScreenerRequest = z.infer<typeof screenerRequestSchema>;

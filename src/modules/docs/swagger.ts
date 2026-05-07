@@ -7,10 +7,10 @@ const options: swaggerJsdoc.Options = {
   definition: {
     openapi: '3.0.3',
     info: {
-      title:       'Alumnus Trading Platform API',
-      version:     '1.0.0',
+      title: 'Alumnus Trading Platform API',
+      version: '1.0.0',
       description: 'Backend API for the Alumnus Trading Platform. All signals are described as bullish or bearish only — no buy/sell language is used.',
-      contact:     { name: 'Raghav Bahety' },
+      contact: { name: 'Raghav Bahety' },
     },
     servers: [
       { url: `http://localhost:${config.PORT}`, description: 'Development' },
@@ -21,7 +21,7 @@ const options: swaggerJsdoc.Options = {
           type:         'http',
           scheme:       'bearer',
           bearerFormat: 'JWT',
-          description:  'JWT access token obtained from POST /api/auth/login',
+          description:  'JWT access token obtained from POST /api/auth/login or POST /api/auth/otp/verify',
         },
       },
       parameters: {
@@ -110,6 +110,30 @@ const options: swaggerJsdoc.Options = {
             },
           },
         },
+        OtpRequestBody: {
+          type:     'object',
+          required: ['email'],
+          properties: {
+            email: { type: 'string', format: 'email', example: 'premium@alumnus.app' },
+          },
+        },
+        OtpVerifyBody: {
+          type:     'object',
+          required: ['email', 'otp'],
+          properties: {
+            email: { type: 'string', format: 'email', example: 'premium@alumnus.app' },
+            otp:   { type: 'string', minLength: 6, maxLength: 6, pattern: '^\\d{6}$', example: '482910' },
+          },
+        },
+        OtpCooldownError: {
+          type: 'object',
+          properties: {
+            status:           { type: 'string', example: 'error' },
+            code:             { type: 'string', example: 'OTP_COOLDOWN' },
+            message:          { type: 'string', example: 'Please wait 47 second(s) before requesting a new OTP' },
+            retryAfterSeconds: { type: 'integer', example: 47 },
+          },
+        },
         WatchlistItem: {
           type: 'object',
           properties: {
@@ -129,88 +153,337 @@ const options: swaggerJsdoc.Options = {
             theme: { type: 'string', enum: ['light', 'dark'] },
           },
         },
+         // ── Screener ───────────────────────────────────────────────────
         ScreenerRequest: {
           type:     'object',
-          required: ['market', 'indicators'],
+          required: ['exchange', 'filters'],
           properties: {
-            market:     { type: 'string', example: 'india' },
-            indicators: {
-              type:     'array',
-              minItems: 1,
-              maxItems: 4,
-              items:    { type: 'string' },
-              example:  ['SMA_20', 'RSI_14'],
+            exchange: { type: 'string', example: 'india', description: 'Exchange identifier' },
+            filters: {
+              type: 'object',
+              description: 'Object whose keys are Python signal names. Values are empty objects {}.',
+              example: { rsi_14: {}, sma_50: {} },
+              additionalProperties: { type: 'object' },
             },
+          },
+        },
+        ScreenedStock: {
+          type: 'object',
+          properties: {
+            symbol:           { type: 'string', example: 'RELIANCE.NS' },
+            latest_price:     { type: 'number', example: 2845.50 },
+            price_change_pct: { type: 'number', example: 1.23, description: 'Percentage price change' },
           },
         },
         ScreenerResponse: {
           type: 'object',
+          description: 'Direct response from Python pipeline — returned unchanged',
           properties: {
-            status: { type: 'string', example: 'success' },
+            success: { type: 'boolean' },
             data: {
               type: 'object',
               properties: {
-                bullish: { type: 'array', items: { type: 'object' } },
-                bearish: { type: 'array', items: { type: 'object' } },
-                neutral: { type: 'array', items: { type: 'object' } },
-              },
-            },
-            meta: {
-              type: 'object',
-              properties: {
-                generatedAt:        { type: 'string', format: 'date-time' },
-                market:             { type: 'string' },
-                selectedIndicators: { type: 'array', items: { type: 'string' } },
-                dataSource:         { type: 'string', example: 'EOD' },
-                fromCache:          { type: 'boolean' },
+                exchange: { type: 'string', example: 'india' },
+                count:    { type: 'integer', example: 42 },
+                buy:     { type: 'array', items: { $ref: '#/components/schemas/ScreenedStock' } },
+                neutral: { type: 'array', items: { $ref: '#/components/schemas/ScreenedStock' } },
+                sell:    { type: 'array', items: { $ref: '#/components/schemas/ScreenedStock' } },
               },
             },
           },
         },
-        ChatMessageRequest: {
+        // ── Backtest ───────────────────────────────────────────────────
+        SignalCountRequest: {
           type:     'object',
-          required: ['query'],
+          required: ['exchange', 'symbol', 'indicator', 'date_from', 'date_to'],
           properties: {
-            query:     { type: 'string', maxLength: 2000, example: 'Which stocks are showing bullish momentum today?' },
-            sessionId: { type: 'string', description: 'Omit to start a new chat session' },
-            context: {
+            exchange:  { type: 'string', example: 'india',          description: "Exchange the stock belongs to. Supported values: 'india', 'us'" },
+            symbol:    { type: 'string', example: 'TATACOMM.NS',    description: 'Stock ticker symbol as used in the exchange' },
+            indicator: { type: 'string', example: 'rsi_14',         description: 'Indicator name' },
+            date_from: { type: 'string', format: 'date',            example: '2026-01-01', description: 'Start date of the range (inclusive)' },
+            date_to:   { type: 'string', format: 'date',            example: '2026-01-31', description: 'End date of the range (inclusive)' },
+          },
+        },
+        SignalCountChartItem: {
+          type: 'object',
+          description: 'OHLCV, technical indicator, and signal values for a single trading date',
+          required: ['date', 'signal'],
+          properties: {
+            date:   { type: 'string', format: 'date', example: '2026-01-15' },
+            signal: { type: 'integer', enum: [-1, 0, 1], example: 1, description: 'Bull(1), Bear(-1), or Neutral(0)' },
+          },
+          additionalProperties: true,
+        },
+        SignalCountResponse: {
+          type: 'object',
+          description: 'Direct response from Python pipeline — returned unchanged',
+          properties: {
+            success: { type: 'boolean' },
+            data: {
               type: 'object',
+              nullable: true,
               properties: {
-                market:               { type: 'string' },
-                selectedIndicators:   { type: 'array', items: { type: 'string' } },
-                recentlyViewedStocks: { type: 'array', items: { type: 'string' } },
+                exchange:          { type: 'string',  example: 'india' },
+                symbol:            { type: 'string',  example: 'TATACOMM.NS' },
+                date_from:         { type: 'string',  format: 'date', example: '2026-01-01' },
+                date_to:           { type: 'string',  format: 'date', example: '2026-01-31' },
+                indicator:         { type: 'string',  example: 'rsi_14' },
+                bull_count:        { type: 'integer', example: 18, description: 'Number of bull signal days' },
+                bear_count:        { type: 'integer', example: 7,  description: 'Number of bear signal days' },
+                plot_chart_signal: {
+                  type:     'array',
+                  nullable: true,
+                  description: 'OHLCV + indicator + signal values sorted by date descending',
+                  items: { $ref: '#/components/schemas/SignalCountChartItem' },
+                },
               },
+            },
+            error: { type: 'string', nullable: true },
+          },
+        },
+        // ── Stock Details ──────────────────────────────────────────────
+        StockDetailsRequest: {
+          type:     'object',
+          required: ['exchange', 'symbol'],
+          properties: {
+            exchange:   { type: 'string', example: 'india' },
+            symbol:     { type: 'string', example: 'RELIANCE.NS', description: 'Include .NS suffix for NSE stocks' },
+            indicators: {
+              type:  'array',
+              items: { type: 'string' },
+              example: ['sma_20', 'rsi_14'],
+              description: 'Technical indicator keys to include in the technicals response',
             },
           },
         },
-        PartialStockDetail: {
+        OHLCVBar: {
           type: 'object',
           properties: {
-            status: { type: 'string', example: 'success' },
-            data: {
+            time:   { type: 'string', example: '2024-01-15' },
+            open:   { type: 'number', example: 2810.00 },
+            high:   { type: 'number', example: 2860.00 },
+            low:    { type: 'number', example: 2800.00 },
+            close:  { type: 'number', example: 2845.50 },
+            volume: { type: 'number', example: 5432100 },
+          },
+        },
+        StockDetailsResponse: {
+          type: 'object',
+          description: 'Direct response from Python pipeline — returned unchanged',
+          properties: {
+            success:    { type: 'boolean' },
+            metadata: {
               type: 'object',
+              nullable: true,
               properties: {
-                metadata:     { type: 'object', nullable: true },
-                chart:        { type: 'object', nullable: true },
-                indicators:   { type: 'object', nullable: true },
-                news:         { type: 'object', nullable: true },
-                fundamentals: { type: 'object', nullable: true },
-                aiSummary:    { type: 'object', nullable: true },
+                company_name: { type: 'string', example: 'Reliance Industries Limited' },
+                sector:       { type: 'string', example: 'Energy' },
+                industry:     { type: 'string', example: 'Oil & Gas' },
+                description:  { type: 'string' },
+                website:      { type: 'string', example: 'https://www.ril.com' },
+                country:      { type: 'string', example: 'India' },
+                employees:    { type: 'integer', example: 236334 },
               },
             },
-            meta: {
-              type: 'object',
-              properties: {
-                generatedAt: { type: 'string', format: 'date-time' },
-                dataSource:  { type: 'string', example: 'EOD' },
-                symbol:      { type: 'string' },
-                range:       { type: 'string' },
+            ohlcv:      { type: 'array', items: { $ref: '#/components/schemas/OHLCVBar' } },
+            technicals: {
+              type:  'array',
+              description: 'One object per date with requested indicator values',
+              items: {
+                type: 'object',
+                properties: {
+                  time:       { type: 'string', example: '2024-01-15' },
+                  sma_20:     { type: 'number', nullable: true },
+                  rsi_14:     { type: 'number', nullable: true },
+                  macd:       { type: 'number', nullable: true },
+                  bb_upper:   { type: 'number', nullable: true },
+                  bb_lower:   { type: 'number', nullable: true },
+                },
+                additionalProperties: { type: 'number', nullable: true },
               },
             },
-            errors: {
+            summary: { type: 'string', description: 'AI-generated text summary of technical conditions' },
+          },
+        },
+ 
+        // ── Stock Snapshot / Fundamentals ──────────────────────────────
+        StockFundamentals: {
+          type: 'object',
+          properties: {
+            symbol:        { type: 'string', example: 'RELIANCE.NS' },
+            date:          { type: 'string', example: '2024-01-15' },
+            open:          { type: 'number', example: 2810.00 },
+            high:          { type: 'number', example: 2860.00 },
+            low:           { type: 'number', example: 2800.00 },
+            close:         { type: 'number', example: 2845.50 },
+            volume:        { type: 'number', example: 5432100 },
+            avg_volume:    { type: 'number', example: 6100000 },
+            trailing_pe:   { type: 'number', example: 27.4 },
+            forward_pe:    { type: 'number', example: 22.1 },
+            market_cap:    { type: 'number', example: 19247000000000 },
+            eps:           { type: 'number', example: 103.8 },
+            high_52w:      { type: 'number', example: 3024.90 },
+            low_52w:       { type: 'number', example: 2220.30 },
+            price_to_book: { type: 'number', example: 2.18 },
+          },
+        },
+        StockSnapshotResponse: {
+          type: 'object',
+          description: 'Direct response from Python pipeline — returned unchanged',
+          properties: {
+            exchange:   { type: 'string', example: 'india' },
+            ticker:     { type: 'string', example: 'RELIANCE.NS' },
+            currency:   { type: 'string', example: 'INR' },
+            stock_data: { $ref: '#/components/schemas/StockFundamentals' },
+          },
+        },
+ 
+        // ── News ───────────────────────────────────────────────────────
+        NewsArticle: {
+          type: 'object',
+          properties: {
+            news_id:        { type: 'string' },
+            title:          { type: 'string', example: 'Reliance reports record quarterly profit' },
+            url:            { type: 'string', format: 'uri' },
+            source:         { type: 'string', example: 'Economic Times' },
+            published_date: { type: 'string', example: '2024-01-15T10:30:00Z' },
+            description:    { type: 'string' },
+            thumbnail_url:  { type: 'string', format: 'uri' },
+            score:          { type: 'number', example: 0.87 },
+          },
+        },
+        StockNewsResponse: {
+          type: 'object',
+          description: 'Direct response from Python pipeline — returned unchanged',
+          properties: {
+            success:             { type: 'boolean' },
+            ticker:              { type: 'string', example: 'RELIANCE.NS' },
+            rss_news:            { type: 'array', items: { $ref: '#/components/schemas/NewsArticle' } },
+            rss_news_count:      { type: 'integer' },
+            rss_summary:         { type: 'string' },
+            telegram_news:       { type: 'array', items: { $ref: '#/components/schemas/NewsArticle' } },
+            telegram_news_count: { type: 'integer' },
+            telegram_summary:    { type: 'string' },
+            full_summary:        { type: 'string', description: 'Combined AI news summary' },
+            error:               { type: 'string', nullable: true },
+          },
+        },
+
+        // ── Chatbot ────────────────────────────────────────────────────
+        ChatRequest: {
+          type:     'object',
+          required: ['message'],
+          properties: {
+            message: {
+              type:      'string',
+              maxLength: 5000,
+              example:   'Which Indian stocks are showing bullish momentum based on RSI?',
+              description: 'User\'s natural language query to the AI analyst',
+            },
+            session_id: {
+              type:        'string',
+              description: 'Session ID for conversation memory. Omit to use the login session ID.',
+              example:     'd82314f5-0a35-4b65-a29e-ce6d4dd75fc2',
+            },
+          },
+        },
+        PlotData: {
+          type: 'object',
+          description: 'Chart data returned by the AI analyst for rendering in the frontend',
+          properties: {
+            type: {
+              type: 'string',
+              enum: ['ohlcv', 'returns', 'chart_with_indicators', 'chart_with_backtest_results'],
+            },
+            start_date: { type: 'string', example: '2023-01-01' },
+            end_date:   { type: 'string', example: '2024-01-15' },
+            data:       { type: 'object', description: 'Plot payload — structure depends on type' },
+          },
+        },
+        ChatResponse: {
+          type: 'object',
+          description: 'Direct response from Python chatbot pipeline — returned unchanged',
+          properties: {
+            query:             { type: 'string', description: 'The user\'s original message' },
+            classification:    {
               type: 'object',
-              description: 'Present only when one or more pipeline calls failed. Keys are section names.',
-              example: { news: 'Service unavailable' },
+              properties: {
+                action:   { type: 'string', example: 'stock_analysis' },
+                response: { type: 'string', nullable: true },
+              },
+            },
+            final_response:    { type: 'string', description: 'AI analyst\'s text response' },
+            plots:             { type: 'array', items: { $ref: '#/components/schemas/PlotData' }, description: 'Charts to render in the frontend' },
+            news:              {
+              type:  'array',
+              description: 'Relevant news articles',
+              items: {
+                type: 'object',
+                properties: {
+                  title:         { type: 'string' },
+                  url:           { type: 'string' },
+                  source:        { type: 'string' },
+                  publishedDate: { type: 'string' },
+                  summary:       { type: 'string' },
+                },
+              },
+            },
+            memory: {
+              type: 'object',
+              properties: {
+                used:             { type: 'boolean' },
+                history_length:   { type: 'integer' },
+                recent_context:   { type: 'string', nullable: true },
+              },
+            },
+          },
+        },
+ 
+        // ── Chat History (Firestore) ───────────────────────────────────
+        ChatSession: {
+          type: 'object',
+          properties: {
+            id:        { type: 'string' },
+            userId:    { type: 'string' },
+            updatedAt: { type: 'string', format: 'date-time' },
+            isActive:  { type: 'boolean' },
+          },
+        },
+        ChatHistoryMessage: {
+          type: 'object',
+          properties: {
+            id:            { type: 'string' },
+            sessionId:     { type: 'string' },
+            userMessage:   { type: 'string' },
+            finalResponse: { type: 'string' },
+            action:        { type: 'string' },
+            hasPlots:      { type: 'boolean' },
+            hasNews:       { type: 'boolean' },
+            createdAt:     { type: 'string', format: 'date-time' },
+          },
+        },
+ 
+        // ── Market Indices ─────────────────────────────────────────────
+        IndicesResponse: {
+          type: 'object',
+          description: 'Direct response from Python pipeline — returned unchanged',
+          properties: {
+            indices: {
+              type: 'object',
+              description: 'Keys are index names e.g. "NIFTY 50", "SENSEX"',
+              additionalProperties: {
+                type: 'object',
+                properties: {
+                  open:       { type: 'number' },
+                  close:      { type: 'number' },
+                  pct_change: { type: 'number' },
+                  date:       { type: 'string' },
+                },
+              },
+              example: {
+                'NIFTY 50': { open: 22100.5, close: 22350.2, pct_change: 1.13, date: '2024-01-15' },
+                'SENSEX':   { open: 72800.0, close: 73500.0, pct_change: 0.96, date: '2024-01-15' },
+              },
             },
           },
         },
@@ -224,6 +497,7 @@ const options: swaggerJsdoc.Options = {
       { name: 'Markets',     description: 'Available markets for screening' },
       { name: 'Indicators',  description: 'Technical indicator discovery' },
       { name: 'Screener',    description: 'Stock screening (bullish/bearish classification)' },
+      { name: 'Backtest',    description: 'Signal count and backtest analysis over a date range' },
       { name: 'Chatbot',     description: 'AI analyst assistant (no buy/sell language)' },
       { name: 'Stocks',      description: 'Stock detail aggregation' },
       { name: 'Logs',        description: 'Application log viewer (developer role only)' },
@@ -277,6 +551,47 @@ const options: swaggerJsdoc.Options = {
           responses: { 200: { description: 'Password reset' }, 400: { description: 'Invalid or expired token' } },
         },
       },
+      // ── OTP auth ──────────────────────────────────────────────────────
+      '/api/auth/otp/request': {
+        post: {
+          tags:        ['Auth'],
+          summary:     'Request a one-time password via email',
+          description: 'Generates a 6-digit OTP, stores a hashed copy in the database, and emails it to the registered address. Always returns 200 regardless of whether the email is registered (prevents enumeration). A 1-minute cooling period applies per email address.',
+          security:    [],
+          requestBody: {
+            required: true,
+            content:  { 'application/json': { schema: { $ref: '#/components/schemas/OtpRequestBody' } } },
+          },
+          responses: {
+            200: {
+              description: 'OTP sent (or silently ignored if email is not registered)',
+              content: { 'application/json': { schema: { allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { properties: { data: { type: 'object', properties: { message: { type: 'string', example: 'If that email is registered, an OTP has been sent.' } } } } }] } } },
+            },
+            422: { description: 'Validation error — invalid email format',    content: { 'application/json': { schema: { $ref: '#/components/schemas/ValidationError' } } } },
+            429: { description: 'Cooling period active — retry too soon',     content: { 'application/json': { schema: { $ref: '#/components/schemas/OtpCooldownError' } } } },
+          },
+        },
+      },
+      '/api/auth/otp/verify': {
+        post: {
+          tags:        ['Auth'],
+          summary:     'Verify OTP and receive auth tokens',
+          description: 'Validates the 6-digit OTP. On success the OTP is deleted (single-use) and the full login payload is returned — identical to `/api/auth/login`. OTPs expire after 5 minutes.',
+          security:    [],
+          requestBody: {
+            required: true,
+            content:  { 'application/json': { schema: { $ref: '#/components/schemas/OtpVerifyBody' } } },
+          },
+          responses: {
+            200: {
+              description: 'OTP valid — tokens issued',
+              content: { 'application/json': { schema: { allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { properties: { data: { $ref: '#/components/schemas/LoginResponse' } } }] } } },
+            },
+            401: { description: 'Invalid or expired OTP', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorEnvelope' } } } },
+            422: { description: 'Validation error',       content: { 'application/json': { schema: { $ref: '#/components/schemas/ValidationError' } } } },
+          },
+        },
+      },
       // ── Watchlist ─────────────────────────────────────────────────────
       '/api/watchlist': {
         get:  { tags: ['Watchlist'], summary: 'Get user watchlist', responses: { 200: { description: 'Watchlist returned', content: { 'application/json': { schema: { type: 'object', properties: { status: { type: 'string' }, data: { type: 'object', properties: { watchlist: { type: 'array', items: { $ref: '#/components/schemas/WatchlistItem' } } } } } } } } } } },
@@ -305,44 +620,161 @@ const options: swaggerJsdoc.Options = {
       '/api/screen': {
         post: {
           tags:        ['Screener'],
-          summary:     'Screen stocks and get bullish/bearish classification',
-          description: 'Signals are described as bullish or bearish only. No buy/sell language is used.',
-          requestBody: { required: true, content: { 'application/json': { schema: { $ref: '#/components/schemas/ScreenerRequest' } } } },
+          summary:     'Screen stocks by technical signals',
+          description: 'Calls Python POST /api/screen and returns the response unchanged.\n\nUse GET /api/signals to get available signal names for the filters object.\n\n**Signal names from Python use buy/sell language internally — but the signals themselves describe technical conditions, not investment advice.**',
+          requestBody: {
+            required: true,
+            content:  { 'application/json': { schema: { $ref: '#/components/schemas/ScreenerRequest' } } },
+          },
           responses: {
-            200: { description: 'Screener results', content: { 'application/json': { schema: { $ref: '#/components/schemas/ScreenerResponse' } } } },
-            400: { description: 'Invalid indicator count (must be 1–4)' },
-            403: { description: 'Indicator not entitled' },
+            200: {
+              description: 'Screener results with buy/neutral/sell categorised stocks',
+              content: { 'application/json': { schema: { $ref: '#/components/schemas/ScreenerResponse' } } },
+            },
+            401: { description: 'Unauthorized' },
+            502: { description: 'Python pipeline unavailable' },
+          },
+        },
+      },
+      // ── Backtest ──────────────────────────────────────────────────────
+      '/api/backtest/signalcount': {
+        post: {
+          tags:        ['Backtest'],
+          summary:     'Get bull and bear signal count for a stock over a date range',
+          description: 'Calls Python POST /api/signalcount and returns the response unchanged.\n\nReturns the number of bull and bear signal days for the given indicator, plus per-day OHLCV + signal data for charting.',
+          requestBody: {
+            required: true,
+            content:  { 'application/json': { schema: { $ref: '#/components/schemas/SignalCountRequest' } } },
+          },
+          responses: {
+            200: {
+              description: 'Signal counts and per-day chart data',
+              content: { 'application/json': { schema: { $ref: '#/components/schemas/SignalCountResponse' } } },
+            },
+            401: { description: 'Unauthorized' },
+            422: { description: 'Validation error — missing or invalid fields' },
+            502: { description: 'Python pipeline unavailable' },
           },
         },
       },
       // ── Chatbot ───────────────────────────────────────────────────────
-      '/api/chat/message': {
+      '/api/chat/respond': {
         post: {
           tags:        ['Chatbot'],
-          summary:     'Send a message to the AI analyst assistant',
-          description: 'The assistant describes conditions as bullish or bearish. It does not use buy/sell language.',
-          requestBody: { required: true, content: { 'application/json': { schema: { $ref: '#/components/schemas/ChatMessageRequest' } } } },
-          responses: { 200: { description: 'Assistant response' } },
+          summary:     'Send a message to the AI analyst',
+          description: 'Calls Python POST /api/chat/respond. Returns the Python response unchanged.\n\nThe conversation is also persisted to Firestore for history (non-blocking).\n\nThe `session_id` in the request body controls Python\'s conversation memory. Omit it to use the login session ID automatically.',
+          requestBody: {
+            required: true,
+            content:  { 'application/json': { schema: { $ref: '#/components/schemas/ChatRequest' } } },
+          },
+          responses: {
+            200: {
+              description: 'AI analyst response with optional plots and news',
+              content: { 'application/json': { schema: { $ref: '#/components/schemas/ChatResponse' } } },
+            },
+            401: { description: 'Unauthorized' },
+            502: { description: 'Python pipeline unavailable' },
+          },
         },
       },
-      '/api/chat/sessions': {
-        get: { tags: ['Chatbot'], summary: 'List chat sessions (paginated)', parameters: [{ name: 'page', in: 'query', schema: { type: 'integer', default: 1 } }, { name: 'limit', in: 'query', schema: { type: 'integer', default: 20 } }], responses: { 200: { description: 'Sessions list' } } },
-      },
-      '/api/chat/sessions/{sessionId}/messages': {
-        get: { tags: ['Chatbot'], summary: 'Get messages for a session', parameters: [{ name: 'sessionId', in: 'path', required: true, schema: { type: 'string' } }], responses: { 200: { description: 'Messages list' }, 404: { description: 'Session not found' } } },
-      },
-      // ── Stocks ────────────────────────────────────────────────────────
-      '/api/stocks/{symbol}': {
+ 
+      '/api/chat/session': {
         get: {
-          tags:        ['Stocks'],
-          summary:     'Get aggregated stock detail (parallel pipelines)',
-          description: 'Aggregates metadata, OHLCV, indicators (entitled only), news, fundamentals, and AI summary. Returns partial results with structured errors if some pipelines fail.',
+          tags:        ['Chatbot'],
+          summary:     'List chat sessions for the current user (from Firestore)',
           parameters: [
-            { name: 'symbol', in: 'path', required: true, schema: { type: 'string', example: 'RELIANCE' } },
-            { name: 'range',  in: 'query', schema: { type: 'string', enum: ['1W', '1M', '3M', '1Y'], default: '1M' } },
+            { name: 'page',  in: 'query', schema: { type: 'integer', default: 1 } },
+            { name: 'limit', in: 'query', schema: { type: 'integer', default: 50, maximum: 100 } },
           ],
           responses: {
-            200: { description: 'Stock detail (may be partial)', content: { 'application/json': { schema: { $ref: '#/components/schemas/PartialStockDetail' } } } },
+            200: {
+              description: 'Paginated sessions',
+              content: { 'application/json': { schema: { allOf: [
+                { $ref: '#/components/schemas/SuccessEnvelope' },
+                { properties: { data: { type: 'object', properties: { sessions: { type: 'array', items: { $ref: '#/components/schemas/ChatSession' } }, pagination: { type: 'object' } } } } },
+              ] } } },
+            },
+          },
+        },
+      },
+ 
+      '/api/chat/messages': {
+        get: {
+          tags:        ['Chatbot'],
+          summary:     'Get message history for a session (from Firestore)',
+          parameters: [
+            { name: 'sessionId', in: 'path', required: true, schema: { type: 'string' } },
+            { name: 'page',      in: 'query', schema: { type: 'integer', default: 1 } },
+            { name: 'limit',     in: 'query', schema: { type: 'integer', default: 50 } },
+          ],
+          responses: {
+            200: {
+              description: 'Message history',
+              content: { 'application/json': { schema: { allOf: [
+                { $ref: '#/components/schemas/SuccessEnvelope' },
+                { properties: { data: { type: 'object', properties: { messages: { type: 'array', items: { $ref: '#/components/schemas/ChatHistoryMessage' } }, pagination: { type: 'object' } } } } },
+              ] } } },
+            },
+            404: { description: 'Session not found or belongs to a different user' },
+          },
+        },
+      },
+      // ── Stocks ────────────────────────────────────────────────────────
+      '/api/stock-details': {
+        post: {
+          tags:        ['Stocks'],
+          summary:     'Get OHLCV + technical indicators + AI summary for a stock',
+          description: 'Calls Python POST /api/stock-details. Returns the Python response unchanged.\n\nFor Indian stocks include `.NS` suffix: `RELIANCE.NS`',
+          requestBody: {
+            required: true,
+            content:  { 'application/json': { schema: { $ref: '#/components/schemas/StockDetailsRequest' } } },
+          },
+          responses: {
+            200: {
+              description: 'Stock details',
+              content: { 'application/json': { schema: { $ref: '#/components/schemas/StockDetailsResponse' } } },
+            },
+            401: { description: 'Unauthorized' },
+            502: { description: 'Python pipeline unavailable' },
+          },
+        },
+      },
+ 
+      '/api/stock-details/stock_snapshot/{exchange}/{symbol}': {
+        post: {
+          tags:        ['Stocks'],
+          summary:     'Get fundamental snapshot for a stock (P/E, market cap, 52w high/low etc.)',
+          description: 'Calls Python POST /api/stock_snapshot/:exchange/:symbol. Returns the Python response unchanged.',
+          parameters: [
+            { name: 'exchange', in: 'path', required: true, schema: { type: 'string', example: 'india' } },
+            { name: 'symbol',   in: 'path', required: true, schema: { type: 'string', example: 'RELIANCE.NS' } },
+          ],
+          responses: {
+            200: {
+              description: 'Fundamental snapshot',
+              content: { 'application/json': { schema: { $ref: '#/components/schemas/StockSnapshotResponse' } } },
+            },
+            401: { description: 'Unauthorized' },
+            502: { description: 'Python pipeline unavailable' },
+          },
+        },
+      },
+ 
+      '/api/stock-details/news/stock/combined/{symbol}': {
+        get: {
+          tags:        ['Stocks'],
+          summary:     'Get combined RSS + Telegram news for a stock',
+          description: 'Calls Python GET /api/news/stock/combined/:symbol. Returns the Python response unchanged.',
+          parameters: [
+            { name: 'symbol', in: 'path', required: true, schema: { type: 'string', example: 'RELIANCE.NS' } },
+          ],
+          responses: {
+            200: {
+              description: 'News articles and AI-generated summary',
+              content: { 'application/json': { schema: { $ref: '#/components/schemas/StockNewsResponse' } } },
+            },
+            401: { description: 'Unauthorized' },
+            502: { description: 'Python pipeline unavailable' },
           },
         },
       },

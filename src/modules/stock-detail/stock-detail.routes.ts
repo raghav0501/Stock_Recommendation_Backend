@@ -1,33 +1,72 @@
+/**
+ * Stock Detail Routes
+ *
+ * POST /api/stock-details                    ← matches Python path
+ * POST /api/stock_snapshot/:exchange/:symbol ← matches Python path
+ * GET  /api/news/stock/combined/:symbol      ← matches Python path
+ */
 import { Router, Request, Response, NextFunction } from 'express';
 import { z } from 'zod';
-import { getStockDetail } from './stock-detail.service';
 import { authenticate, loadEntitlements } from '../../middleware/auth';
 import { AuthenticatedRequest } from '../../types';
+import {
+  getStockDetails,
+  getStockSnapshot,
+  getStockNews,
+} from './stock-detail.service';
 
-const querySchema = z.object({
-  range: z.enum(['1W', '1M', '3M', '1Y']).default('1M'),
+// Re-export for import convenience
+export { getStockDetails, getStockSnapshot, getStockNews };
+
+const stockDetailsSchema = z.object({
+  exchange:   z.string().min(1),
+  symbol:     z.string().min(1),
+  indicators: z.array(z.string()).optional().default([]),
 });
 
-async function detail(req: Request, res: Response, next: NextFunction): Promise<void> {
+function getCtx(req: AuthenticatedRequest) {
+  return {
+    sessionId: req.ctx.sessionId,
+    requestId: req.ctx.requestId,
+    userId:    req.user.id,
+  };
+}
+
+// ── Controllers ────────────────────────────────────────────────────────────
+
+async function stockDetails(req: Request, res: Response, next: NextFunction): Promise<void> {
   try {
     const authReq = req as AuthenticatedRequest;
-    const symbol  = req.params.symbol?.toUpperCase();
-    const { range } = querySchema.parse(req.query);
-
-    if (!symbol) { res.status(400).json({ status: 'error', code: 'MISSING_SYMBOL', message: 'Symbol is required' }); return; }
-
-    const result = await getStockDetail(symbol, range, {
-      sessionId:            authReq.ctx.sessionId,
-      requestId:            authReq.ctx.requestId,
-      userId:               authReq.user.id,
-      entitledIndicatorIds: authReq.user.entitledIndicatorIds,
-    });
-
-    res.json({ status: 'success', ...result });
+    const body    = stockDetailsSchema.parse(req.body);
+    const result  = await getStockDetails(body.exchange, body.symbol, body.indicators, getCtx(authReq));
+    res.json(result);
   } catch (err) { next(err); }
 }
 
+async function stockSnapshot(req: Request, res: Response, next: NextFunction): Promise<void> {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const { exchange, symbol } = req.params;
+    const result = await getStockSnapshot(exchange, symbol, getCtx(authReq));
+    res.json(result);
+  } catch (err) { next(err); }
+}
+
+async function stockNews(req: Request, res: Response, next: NextFunction): Promise<void> {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const { symbol } = req.params;
+    const result = await getStockNews(symbol, getCtx(authReq));
+    res.json(result);
+  } catch (err) { next(err); }
+}
+
+// ── Router ─────────────────────────────────────────────────────────────────
 const router = Router();
-router.get('/:symbol', authenticate, loadEntitlements, detail);
+router.use(authenticate, loadEntitlements);
+
+router.post('/', stockDetails);
+router.post('/stock_snapshot/:exchange/:symbol', stockSnapshot);
+router.get('/news/stock/combined/:symbol', stockNews);
 
 export default router;

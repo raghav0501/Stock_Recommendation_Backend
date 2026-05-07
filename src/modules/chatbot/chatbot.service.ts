@@ -1,261 +1,194 @@
 /**
- * Chatbot service — now backed by Firestore instead of MongoDB/Mongoose.
+ * Chatbot Service
  *
- * Collections:
- *   chat_sessions/{sessionId}               – session metadata
- *   chat_messages/{messageId}               – individual messages
+ * Design: ONE fixed session per user.
+ *   - chat_sessions doc id  = userId   (not a random UUID)
+ *   - chat_messages doc id  = uuidv4() (many per user, all have userId + createdAt)
+ *
+ * Firestore structure:
+ *   chat_sessions/{userId}          → session metadata
+ *   chat_messages/{uuid}            → individual message pairs (user + assistant)
+ *
+ * Queries used:
+ *   - getSession  → db.collection('chat_sessions').doc(userId).get()   ← NO index needed
+ *   - getMessages → .where('userId','==',userId).orderBy('createdAt','asc')
+ *                   Requires composite index: userId ASC + createdAt ASC
+ *                   (one-time setup — link in README)
+ *
+ * Index error fix:
+ *   The old code ran .where('userId','==').orderBy('updatedAt') on chat_sessions,
+ *   which requires a composite index. Now we use .doc(userId).get() — no index at all.
+ *   For chat_messages we still need a composite index. See README for the Console link.
  */
 import { v4 as uuidv4 } from 'uuid';
-import axios from 'axios';
-import { StatusCodes } from 'http-status-codes';
-import { config } from '../../config';
+import { callPython, PythonCallContext } from '../../utils/pythonClient';
 import { getFirestore, Collections } from '../../infrastructure/firebase/client';
 import { createServiceLogger } from '../../infrastructure/logger';
-import { chatbotPipelineResponseSchema } from './chatbot.schema';
 
 const log = createServiceLogger('chatbot');
 
-interface ChatContext {
-  sessionId: string;
-  requestId: string;
-  userId:    string;
+export interface ChatResponse {
+  query:             string;
+  classification:    { action: string; response?: string };
+  plan:              unknown;
+  agent_big_results: unknown;
+  agent_results:     unknown[] | null;
+  final_response:    string;
+  plots:             unknown[];
+  news:              unknown[];
+  memory: {
+    used:                 boolean;
+    conversation_history: Array<{ user: string; assistant: string }>;
+    recent_context:       string | null;
+    history_length:       number;
+  };
 }
 
-interface UserContext {
-  market?:               string;
-  selectedIndicators?:   string[];
-  recentlyViewedStocks?: string[];
-}
+// ── Send message ──────────────────────────────────────────────────────────
 
-// ── Firestore document shapes ──────────────────────────────────────────────
-interface ChatSessionDoc {
-  id:        string;
-  userId:    string;
-  title:     string;
-  context?:  UserContext;
-  isActive:  boolean;
-  createdAt: string;
-  updatedAt: string;
-}
-
-interface ChatMessageDoc {
-  id:        string;
-  sessionId: string;
-  userId:    string;
-  role:      'user' | 'assistant';
-  content:   string;
-  plots?:    unknown[];
-  news?:     unknown[];
-  createdAt: string;
-}
-
-// ── Helpers ────────────────────────────────────────────────────────────────
-function now(): string {
-  return new Date().toISOString();
-}
-
-// ── Send a message ─────────────────────────────────────────────────────────
 export async function sendMessage(
-  userId:        string,
-  query:         string,
-  chatSessionId: string | undefined,
-  userContext:   UserContext | undefined,
-  ctx:           ChatContext,
-) {
-  const db = getFirestore();
+  message:   string,
+  userId:    string,      // used as the Firestore session doc ID
+  ctx:       PythonCallContext,
+): Promise<ChatResponse> {
+  log.info('Chat message received', {
+    sessionId: ctx.sessionId, requestId: ctx.requestId, userId: ctx.userId,
+    meta: { messageLength: message.length },
+  });
 
-  // ── Resolve or create session ──────────────────────────────────────────
-  let session: ChatSessionDoc;
+  // Forward userId as the Python session_id so conversation memory is per-user
+  const result = await callPython<ChatResponse>(
+    'POST',
+    '/api/chat/respond',
+    ctx,
+    { message, session_id: userId },
+  );
 
-  if (chatSessionId) {
-    const snap = await db.collection(Collections.CHAT_SESSIONS).doc(chatSessionId).get();
-    if (!snap.exists || (snap.data() as ChatSessionDoc).userId !== userId) {
-      throw Object.assign(new Error('Chat session not found'), {
-        statusCode: StatusCodes.NOT_FOUND, code: 'SESSION_NOT_FOUND',
-      });
-    }
-    session = { id: snap.id, ...snap.data() } as ChatSessionDoc;
-  } else {
-    const newId = uuidv4();
-    session = {
-      id:        newId,
+  log.info('Chat response received', {
+    sessionId: ctx.sessionId, requestId: ctx.requestId, userId: ctx.userId,
+    meta: {
+      action:   result.classification?.action,
+      hasPlots: (result.plots?.length ?? 0) > 0,
+      hasNews:  (result.news?.length ?? 0) > 0,
+    },
+  });
+
+  // Persist to Firestore — non-blocking so the user gets the response immediately
+  _persistToFirestore(userId, message, result, ctx).catch((err) => {
+    log.warn('Failed to persist chat message to Firestore', {
+      sessionId: ctx.sessionId, requestId: ctx.requestId,
+      meta: { err: String(err) },
+    });
+  });
+
+  return result;
+}
+
+async function _persistToFirestore(
+  userId:   string,
+  message:  string,
+  response: ChatResponse,
+  ctx:      PythonCallContext,
+): Promise<void> {
+  const db  = getFirestore();
+  const now = new Date().toISOString();
+
+  // ── Upsert the single session doc (doc id = userId) ──────────────────
+  // Using merge:true so the first message creates the doc and subsequent
+  // messages just update updatedAt and messageCount.
+  const sessionRef = db.collection(Collections.CHAT_SESSIONS).doc(userId);
+  const sessionSnap = await sessionRef.get();
+
+  if (!sessionSnap.exists) {
+    // First message for this user — create the session
+    await sessionRef.set({
       userId,
-      title:     query.slice(0, 60),
-      context:   userContext,
-      isActive:  true,
-      createdAt: now(),
-      updatedAt: now(),
-    };
-    await db.collection(Collections.CHAT_SESSIONS).doc(newId).set(session);
-    log.info('New chat session created', { ...ctx, meta: { chatSessionId: newId } });
-  }
-
-  // ── Persist user message ───────────────────────────────────────────────
-  const userMsgId  = uuidv4();
-  const userMsgDoc: ChatMessageDoc = {
-    id:        userMsgId,
-    sessionId: session.id,
-    userId,
-    role:      'user',
-    content:   query,
-    createdAt: now(),
-  };
-  await db.collection(Collections.CHAT_MESSAGES).doc(userMsgId).set(userMsgDoc);
-
-  // ── Call chatbot pipeline ──────────────────────────────────────────────
-  const start = Date.now();
-  let assistantText: string;
-  let plots: unknown[] = [];
-  let news:  unknown[] = [];
-  let signalSummary: unknown = null;
-
-  try {
-    const response = await axios.post(
-      `${config.PIPELINE_CHATBOT_URL}/chat`,
-      {
-        query,
-        context: {
-          market:      userContext?.market,
-          indicators:  userContext?.selectedIndicators,
-          recentStocks: userContext?.recentlyViewedStocks,
-        },
-        userId,
-      },
-      {
-        timeout: config.PIPELINE_TIMEOUT_MS,
-        headers: {
-          'x-session-id': ctx.sessionId,
-          'x-request-id': ctx.requestId,
-        },
-      },
-    );
-
-    const latencyMs = Date.now() - start;
-    const parsed    = chatbotPipelineResponseSchema.safeParse(response.data);
-
-    if (!parsed.success) {
-      log.error('Chatbot pipeline schema invalid', {
-        ...ctx, meta: { errors: parsed.error.flatten() },
-      });
-      throw Object.assign(new Error('Chatbot returned an invalid response'), {
-        statusCode: StatusCodes.BAD_GATEWAY, code: 'PIPELINE_SCHEMA_ERROR',
-      });
-    }
-
-    assistantText = parsed.data.text;
-    plots         = parsed.data.plots;
-    news          = parsed.data.newsSnippets;
-    signalSummary = parsed.data.signalSummary ?? null;
-
-    log.pipelineCall('chatbot', latencyMs, 'success', ctx);
-
-  } catch (err) {
-    const latencyMs = Date.now() - start;
-    if ((err as { code?: string }).code === 'PIPELINE_SCHEMA_ERROR') throw err;
-
-    log.pipelineCall('chatbot', latencyMs, 'error', ctx, String(err));
-    log.warn('Chatbot pipeline unavailable – returning dummy response', ctx);
-    assistantText = _dummyResponse(query);
-  }
-
-  // ── Persist assistant message ──────────────────────────────────────────
-  const asstMsgId  = uuidv4();
-  const asstMsgDoc: ChatMessageDoc = {
-    id:        asstMsgId,
-    sessionId: session.id,
-    userId,
-    role:      'assistant',
-    content:   assistantText,
-    plots,
-    news,
-    createdAt: now(),
-  };
-  await db.collection(Collections.CHAT_MESSAGES).doc(asstMsgId).set(asstMsgDoc);
-
-  // ── Update session timestamp ───────────────────────────────────────────
-  await db.collection(Collections.CHAT_SESSIONS)
-    .doc(session.id)
-    .update({ updatedAt: now() });
-
-  log.info('Chat message handled', { ...ctx, meta: { chatSessionId: session.id } });
-
-  return {
-    sessionId: session.id,
-    message: {
-      id:           asstMsgId,
-      role:         'assistant',
-      content:      assistantText,
-      plots,
-      news,
-      signalSummary,
-      createdAt:    asstMsgDoc.createdAt,
-    },
-  };
-}
-
-// ── Get sessions list (paginated) ─────────────────────────────────────────
-export async function getSessions(
-  userId: string,
-  page:   number,
-  limit:  number,
-  ctx:    ChatContext,
-) {
-  const db = getFirestore();
-
-  const snap = await db
-    .collection(Collections.CHAT_SESSIONS)
-    .where('userId', '==', userId)
-    .orderBy('updatedAt', 'desc')
-    .limit(page * limit)
-    .get();
-
-  const allSessions = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-  const start       = (page - 1) * limit;
-  const sessions    = allSessions.slice(start, start + limit);
-
-  log.info('Chat sessions listed', { ...ctx });
-
-  return {
-    sessions,
-    pagination: {
-      page,
-      limit,
-      total:      allSessions.length,
-      totalPages: Math.ceil(allSessions.length / limit),
-    },
-  };
-}
-
-// ── Get messages for a session (paginated) ────────────────────────────────
-export async function getSessionMessages(
-  userId:        string,
-  chatSessionId: string,
-  page:          number,
-  limit:         number,
-  ctx:           ChatContext,
-) {
-  const db = getFirestore();
-
-  // Verify session belongs to user
-  const sessionSnap = await db.collection(Collections.CHAT_SESSIONS).doc(chatSessionId).get();
-  if (!sessionSnap.exists || (sessionSnap.data() as ChatSessionDoc).userId !== userId) {
-    throw Object.assign(new Error('Session not found'), {
-      statusCode: StatusCodes.NOT_FOUND, code: 'SESSION_NOT_FOUND',
+      createdAt:    now,
+      updatedAt:    now,
+      messageCount: 1,
+      lastMessage:  message.slice(0, 120),
+      isActive:     true,
+    });
+  } else {
+    // Subsequent messages — increment count and refresh preview
+    const existing = sessionSnap.data() as { messageCount?: number };
+    await sessionRef.update({
+      updatedAt:    now,
+      messageCount: (existing.messageCount ?? 0) + 1,
+      lastMessage:  message.slice(0, 120),
     });
   }
 
+  // ── Write individual message document ────────────────────────────────
+  // doc id is random so we can write many messages cheaply
+  const msgId = uuidv4();
+  await db.collection(Collections.CHAT_MESSAGES).doc(msgId).set({
+    id:            msgId,
+    userId,                              // ← used in index: userId + createdAt
+    sessionId:     userId,               // sessionId = userId (one session per user)
+    userMessage:   message,
+    finalResponse: response.final_response ?? '',
+    action:        response.classification?.action ?? '',
+    hasPlots:      (response.plots?.length ?? 0) > 0,
+    hasNews:       (response.news?.length ?? 0) > 0,
+    createdAt:     now,                  // ← used in index for ordering
+  });
+
+  log.info('Chat persisted to Firestore', {
+    sessionId: ctx.sessionId, requestId: ctx.requestId, userId,
+    meta: { msgId },
+  });
+}
+
+// ── Get session (single session per user) ─────────────────────────────────
+// No query — direct doc lookup by userId. No composite index required.
+
+export async function getSession(userId: string) {
+  const db   = getFirestore();
+  const snap = await db.collection(Collections.CHAT_SESSIONS).doc(userId).get();
+
+  if (!snap.exists) {
+    return { session: null };
+  }
+
+  return {
+    session: { id: snap.id, ...snap.data() },
+  };
+}
+
+// ── Get messages for the user's session (paginated) ───────────────────────
+// Requires composite index: chat_messages — userId ASC + createdAt ASC
+// Create at: https://console.firebase.google.com → Firestore → Indexes → Add index
+
+export async function getMessages(
+  userId: string,
+  page:   number,
+  limit:  number,
+) {
+  const db = getFirestore();
+
+  // Verify session exists first (cheap direct lookup)
+  const sessionSnap = await db.collection(Collections.CHAT_SESSIONS).doc(userId).get();
+  if (!sessionSnap.exists) {
+    return {
+      session:    null,
+      messages:   [],
+      pagination: { page, limit, total: 0, totalPages: 0 },
+    };
+  }
+
+  // Fetch messages ordered by createdAt
+  // Firestore doesn't support OFFSET — we fetch page*limit and slice
   const snap = await db
     .collection(Collections.CHAT_MESSAGES)
-    .where('sessionId', '==', chatSessionId)
+    .where('userId', '==', userId)
     .orderBy('createdAt', 'asc')
     .limit(page * limit)
     .get();
 
-  const allMessages = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-  const start       = (page - 1) * limit;
-  const messages    = allMessages.slice(start, start + limit);
-
-  log.info('Chat messages listed', { ...ctx, meta: { chatSessionId } });
+  const all      = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+  const start    = (page - 1) * limit;
+  const messages = all.slice(start, start + limit);
 
   return {
     session:    { id: sessionSnap.id, ...sessionSnap.data() },
@@ -263,20 +196,8 @@ export async function getSessionMessages(
     pagination: {
       page,
       limit,
-      total:      allMessages.length,
-      totalPages: Math.ceil(allMessages.length / limit),
+      total:      all.length,
+      totalPages: Math.ceil(all.length / limit),
     },
   };
-}
-
-// ── Dummy response ─────────────────────────────────────────────────────────
-function _dummyResponse(query: string): string {
-  const q = query.toLowerCase();
-  if (q.includes('bullish') || q.includes('good')) {
-    return 'Based on recent technical indicators, several stocks are showing bullish momentum. (Note: placeholder response — AI analyst pipeline not yet connected.)';
-  }
-  if (q.includes('bearish') || q.includes('bad')) {
-    return 'Current technical analysis indicates bearish conditions for several securities. (Note: placeholder response — AI analyst pipeline not yet connected.)';
-  }
-  return `You asked: "${query}". The AI analyst pipeline is not yet connected. Once live, I will analyse stocks using technical indicators and describe conditions as bullish or bearish only. I do not provide buy or sell advice.`;
 }

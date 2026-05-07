@@ -92,6 +92,61 @@ async function deleteRefreshToken(userId: string): Promise<void> {
     .delete();
 }
 
+// ── Session builder (shared by password login and OTP verification) ───────
+export async function createSessionForUserId(
+  userId: string,
+  ctx: { sessionId: string; requestId: string },
+): Promise<LoginResult> {
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    include: {
+      role: {
+        include: {
+          roleIndicators: { include: { indicator: true } },
+        },
+      },
+      preferences: true,
+    },
+  });
+
+  if (!user || !user.isActive) {
+    throw Object.assign(new Error('User not found or inactive'), {
+      statusCode: StatusCodes.UNAUTHORIZED, code: 'USER_INACTIVE',
+    });
+  }
+
+  const accessToken = signAccessToken(user.id, user.role.name);
+  const rawRefresh  = generateRefreshToken(user.id);
+  const encRefresh  = await storeRefreshToken(user.id, rawRefresh);
+  const sessionId   = ctx.sessionId ?? uuidv4();
+  const markets     = await prisma.market.findMany({ where: { isActive: true } });
+
+  const entitledIndicators: IndicatorMeta[] = user.role.roleIndicators
+    .filter((ri) => ri.indicator.isActive)
+    .map((ri) => ({
+      id:          ri.indicator.id,
+      name:        ri.indicator.name,
+      description: ri.indicator.description,
+      category:    ri.indicator.category,
+      scale:       ri.indicator.scale,
+    }));
+
+  return {
+    accessToken,
+    refreshToken: encRefresh,
+    sessionId,
+    user: {
+      id:    user.id,
+      name:  user.name,
+      email: user.email,
+      role:  user.role.name,
+      theme: user.preferences?.theme ?? 'light',
+    },
+    markets:            markets.map((m) => ({ id: m.id, name: m.name, exchange: m.exchange })),
+    entitledIndicators,
+  };
+}
+
 // ── Login ──────────────────────────────────────────────────────────────────
 export interface LoginPayload {
   email: string;
