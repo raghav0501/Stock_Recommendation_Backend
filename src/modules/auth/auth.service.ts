@@ -142,7 +142,7 @@ export async function createSessionForUserId(
       role:  user.role.name,
       theme: user.preferences?.theme ?? 'light',
     },
-    markets:            markets.map((m) => ({ id: m.id, name: m.name, exchange: m.exchange })),
+    markets: markets.map((m) => ({ id: m.id, name: m.name, fullName: m.fullName, country: m.country, description: m.description })),
     entitledIndicators,
   };
 }
@@ -238,7 +238,7 @@ export async function loginUser(
       role: user.role.name,
       theme: user.preferences?.theme ?? 'light',
     },
-    markets: markets.map((m) => ({ id: m.id, name: m.name, exchange: m.exchange })),
+    markets: markets.map((m) => ({ id: m.id, name: m.name, fullName: m.fullName, country: m.country, description: m.description })),
     entitledIndicators,
   };
 }

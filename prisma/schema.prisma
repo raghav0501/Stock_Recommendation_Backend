@@ -65,10 +65,12 @@ model RoleIndicator {
 }
 
 model Market {
-  id       String  @id // "india" | "us"
-  name     String  // "Indian Market"
-  exchange String  // "NSE/BSE"
-  isActive Boolean @default(true) @map("is_active")
+  id          String  @id
+  name        String
+  fullName    String  @map("full_name")
+  country     String
+  description String?
+  isActive    Boolean @default(true) @map("is_active")
 
   @@map("markets")
 }

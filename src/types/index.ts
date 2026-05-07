@@ -66,5 +66,7 @@ export interface IndicatorMeta {
 export interface MarketMeta {
   id: string;
   name: string;
-  exchange: string;
+  fullName: string;
+  country: string;
+  description?: string | null;
 }
