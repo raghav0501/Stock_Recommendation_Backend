@@ -4,9 +4,16 @@ import { signalCountRequestSchema } from './backtest.schema';
 import { getSignalCount } from './backtest.service';
 import { AuthenticatedRequest } from '../../types';
 import { sendSuccess } from '../../utils/response';
+import { createServiceLogger } from '../../infrastructure/logger';
+
+const log = createServiceLogger('backtest');
 
 export async function signalCount(req: Request, res: Response, next: NextFunction): Promise<void> {
   try {
+    log.info('Received signal count request', {
+      requestId: (req as AuthenticatedRequest).ctx.requestId,
+      userId:    (req as AuthenticatedRequest).user.id,
+    });
     const authReq = req as AuthenticatedRequest;
     const body    = signalCountRequestSchema.parse(req.body);
 
@@ -18,6 +25,10 @@ export async function signalCount(req: Request, res: Response, next: NextFunctio
 
     sendSuccess(res, data, StatusCodes.OK);
   } catch (err) {
+    log.error('Error in signal count request', {
+      requestId: (req as AuthenticatedRequest).ctx.requestId,
+      userId: (req as AuthenticatedRequest).user.id,
+    });
     next(err);
   }
 }

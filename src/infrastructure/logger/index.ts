@@ -2,7 +2,7 @@
  * Winston logger.
  *
  * Transports:
- *  - Console (development only, colourised)
+ *  - Console (always active — colorized; stdout is captured by Cloud Run)
  *  - Rotating file (always active — primary persistent store)
  *
  * Firestore logging is handled separately via the FirestoreLogService
@@ -32,13 +32,9 @@ const consoleFormat = winston.format.combine(
   }),
 );
 
-const transports: winston.transport[] = [];
-
-if (config.NODE_ENV === 'development') {
-  transports.push(
-    new winston.transports.Console({ format: consoleFormat, level: config.LOG_LEVEL }),
-  );
-}
+const transports: winston.transport[] = [
+  new winston.transports.Console({ format: consoleFormat, level: config.LOG_LEVEL }),
+];
 
 // Rotating file — always active
 transports.push(

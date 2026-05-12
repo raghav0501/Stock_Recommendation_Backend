@@ -13,6 +13,12 @@ const envSchema = z.object({
   DATABASE_URL: z.string().min(1, 'DATABASE_URL is required'),
 
   // ── Firebase ───────────────────────────────────────────────────────────
+  // Optional locally — omit when running inside Firebase Functions (uses ADC)
+  GCP_SERVICE_ACCOUNT_PATH: z.string().optional(),
+  // Falls back to GCLOUD_PROJECT injected by the Firebase Functions runtime
+  GCP_PROJECT_ID: z.string().optional(),
+  GCP_DATABASE_ID: z.string().default('(default)'),
+
   // Path to your Firebase service account JSON key file
   FIREBASE_SERVICE_ACCOUNT_PATH: z.string().min(1, 'FIREBASE_SERVICE_ACCOUNT_PATH is required'),
   // Your Firebase project ID

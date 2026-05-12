@@ -25,25 +25,25 @@ export function initFirebase(): Firestore {
   if (_db) return _db;
 
   if (!admin.apps.length) {
-    const serviceAccount = JSON.parse(
-      readFileSync(config.FIREBASE_SERVICE_ACCOUNT_PATH, 'utf-8'),
-    ) as admin.ServiceAccount;
+    // Use service account file locally; rely on ADC when running in Firebase Functions
+    const projectId = config.GCP_PROJECT_ID ?? process.env.GCLOUD_PROJECT;
 
-    admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount),
-      projectId:  config.FIREBASE_PROJECT_ID,
-    });
+    if (config.GCP_SERVICE_ACCOUNT_PATH) {
+      const serviceAccount = JSON.parse(
+        readFileSync(config.GCP_SERVICE_ACCOUNT_PATH, 'utf-8'),
+      ) as admin.ServiceAccount;
+      admin.initializeApp({ credential: admin.credential.cert(serviceAccount), projectId });
+    } else {
+      admin.initializeApp({ projectId });
+    }
 
-    log.info('Firebase Admin SDK initialised', {
-      meta: { projectId: config.FIREBASE_PROJECT_ID },
-    });
+    log.info('Firebase Admin SDK initialised', { meta: { projectId } });
   }
 
-  // Pass the database ID explicitly — required when using a non-default database
   _db = admin.firestore();
   _db.settings({
     ignoreUndefinedProperties: true,
-    databaseId: config.FIREBASE_DATABASE_ID,
+    databaseId: config.GCP_DATABASE_ID,
   });
 
   return _db;
